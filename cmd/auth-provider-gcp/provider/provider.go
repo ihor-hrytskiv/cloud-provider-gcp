@@ -17,11 +17,14 @@ limitations under the License.
 package provider
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"time"
 
+	"google.golang.org/api/option"
+	"google.golang.org/api/sts/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cloud-provider-gcp/pkg/credentialconfig"
 	"k8s.io/cloud-provider-gcp/pkg/gcpcredential"
@@ -67,6 +70,26 @@ func MakeDockerConfigURLProvider(transport *http.Transport) *gcpcredential.Docke
 	return provider
 }
 
+func MakeK8sSAWIFProvider(transport *http.Transport) (*gcpcredential.K8sSAWIFProvider, error) {
+	ctx := context.Background()
+	httpClient := makeHTTPClient(transport)
+	stsService, err := sts.NewService(ctx, option.WithHTTPClient(httpClient))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create sts service: %w", err)
+	}
+	provider := &gcpcredential.K8sSAWIFProvider{
+		WIFConfig: gcpcredential.WIFConfig{
+			ProjectNumber: os.Getenv("GCP_WIF_PROJECT_NUMBER"),
+			PoolId:        os.Getenv("GCP_WIF_POOL_ID"),
+			ProviderId:    os.Getenv("GCP_WIF_PROVIDER_ID"),
+		},
+		StsService:           stsService,
+		UseRegistryFromImage: true,
+	}
+
+	return provider, nil
+}
+
 func makeHTTPClient(transport *http.Transport) *http.Client {
 	return &http.Client{
 		Transport: transport,
@@ -109,8 +132,8 @@ func getCacheKeyType() (credentialproviderapi.PluginCacheKeyType, error) {
 }
 
 // GetResponse queries the given provider for credentials.
-func GetResponse(image string, provider credentialconfig.DockerConfigProvider) (*credentialproviderapi.CredentialProviderResponse, error) {
-	cfg := provider.Provide(image)
+func GetResponse(authRequest credentialproviderapi.CredentialProviderRequest, provider credentialconfig.DockerConfigProvider) (*credentialproviderapi.CredentialProviderResponse, error) {
+	cfg := provider.Provide(authRequest)
 	response := &credentialproviderapi.CredentialProviderResponse{Auth: make(map[string]credentialproviderapi.AuthConfig)}
 	for url, dockerConfig := range cfg {
 		response.Auth[url] = credentialproviderapi.AuthConfig{Username: dockerConfig.Username, Password: dockerConfig.Password}

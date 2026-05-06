@@ -18,6 +18,7 @@ package gcpcredential
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,8 +26,11 @@ import (
 	"strings"
 	"time"
 
+	credentials "cloud.google.com/go/iam/credentials/apiv1"
+	"google.golang.org/api/sts/v1"
 	"k8s.io/cloud-provider-gcp/pkg/credentialconfig"
 	"k8s.io/klog/v2"
+	credentialproviderapi "k8s.io/kubelet/pkg/apis/credentialprovider/v1"
 )
 
 const (
@@ -76,6 +80,85 @@ type DockerConfigURLKeyProvider struct {
 	MetadataProvider
 }
 
+// WIFConfig is a config that uses K8sSAWIFProvider to exchange Kubernetes Service Account tokens for GCR credentials. It requires the following environment variables to be set:
+// - GCP_WIF_PROJECT_NUMBER: the project number of the GCP project that contains the workload identity pool and provider to use for token exchange.
+// - GCP_WIF_POOL_ID: the ID of the workload identity pool to use for token exchange.
+// - GCP_WIF_PROVIDER_ID: the ID of the workload identity provider to use for token exchange.
+type WIFConfig struct {
+	ProjectNumber string
+	PoolId        string
+	ProviderId    string
+}
+
+// K8sSAWIFProvider is a DockerConfigProvider that uses Kubernetes Service Account tokens and Google STS API to exchange for access tokens, which are then used as credentials for GCR.
+type K8sSAWIFProvider struct {
+	WIFConfig
+	StsService           *sts.Service
+	UseRegistryFromImage bool
+}
+
+// Enabled checks if K8sSAWIF provider is available
+func (g *K8sSAWIFProvider) Enabled() bool {
+	if g.ProjectNumber == "" || g.PoolId == "" || g.ProviderId == "" {
+		klog.V(2).Infof("K8sSAWIFProvider is not enabled because one of the required environment variables is not set. GCP_WIF_PROJECT_NUMBER: %t, GCP_WIF_POOL_ID: %t, GCP_WIF_PROVIDER_ID: %t", g.ProjectNumber != "", g.PoolId != "", g.ProviderId != "")
+		return false
+	}
+
+	return true
+}
+
+// Provide implements DockerConfigProvider. It exchanges the provided service account token for an access token using the STS API, and returns a DockerConfig with that access token as the password.
+func (g *K8sSAWIFProvider) Provide(authRequest credentialproviderapi.CredentialProviderRequest) credentialconfig.DockerConfig {
+	cfg := credentialconfig.DockerConfig{}
+
+	if g.ProjectNumber == "" || g.PoolId == "" || g.ProviderId == "" {
+		klog.Errorf("K8sSAWIFProvider is not properly configured. One of the required environment variables is not set. GCP_WIF_PROJECT_NUMBER: %t, GCP_WIF_POOL_ID: %t, GCP_WIF_PROVIDER_ID: %t", g.ProjectNumber != "", g.PoolId != "", g.ProviderId != "")
+		return cfg
+	}
+
+	audience := fmt.Sprintf(
+		"//iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s/providers/%s",
+		g.ProjectNumber,
+		g.PoolId,
+		g.ProviderId,
+	)
+
+	stsRequest := &sts.GoogleIdentityStsV1ExchangeTokenRequest{
+		Audience:           audience,
+		GrantType:          "urn:ietf:params:oauth:grant-type:token-exchange",
+		Scope:              credentials.DefaultAuthScopes()[0],
+		RequestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+		SubjectTokenType:   "urn:ietf:params:oauth:token-type:jwt",
+		SubjectToken:       authRequest.ServiceAccountToken,
+	}
+
+	stsResponse, err := g.StsService.V1.Token(stsRequest).Do()
+	if err != nil {
+		klog.Errorf("IdentityBindingToken exchange error with audience %q: %v", audience, err)
+		return cfg
+	}
+
+	entry := credentialconfig.DockerConfigEntry{
+		Username: "_token",
+		Password: stsResponse.AccessToken,
+	}
+
+	// If UseRegistryFromImage is true, we will directly give the credential to the registry of the image.
+	// Currently, this is only used by auth-provider-gcp.
+	if g.UseRegistryFromImage {
+		if registry, _, found := strings.Cut(authRequest.Image, "/"); found {
+			cfg[registry] = entry
+		}
+	}
+
+	// Add our entry for each of the supported container registry URLs
+	for _, k := range containerRegistryUrls {
+		cfg[k] = entry
+	}
+
+	return cfg
+}
+
 // ContainerRegistryProvider is a DockerConfigProvider that provides a dockercfg with:
 //
 //	Username: "_token"
@@ -118,7 +201,7 @@ func (g *MetadataProvider) Enabled() bool {
 }
 
 // Provide implements DockerConfigProvider
-func (g *DockerConfigKeyProvider) Provide(image string) credentialconfig.DockerConfig {
+func (g *DockerConfigKeyProvider) Provide(authRequest credentialproviderapi.CredentialProviderRequest) credentialconfig.DockerConfig {
 	// Read the contents of the google-dockercfg metadata key and
 	// parse them as an alternate .dockercfg
 	if cfg, err := credentialconfig.ReadDockerConfigFileFromURL(DockerConfigKey, g.Client, metadataHeader); err != nil {
@@ -131,7 +214,7 @@ func (g *DockerConfigKeyProvider) Provide(image string) credentialconfig.DockerC
 }
 
 // Provide implements DockerConfigProvider
-func (g *DockerConfigURLKeyProvider) Provide(image string) credentialconfig.DockerConfig {
+func (g *DockerConfigURLKeyProvider) Provide(authRequest credentialproviderapi.CredentialProviderRequest) credentialconfig.DockerConfig {
 	// Read the contents of the google-dockercfg-url key and load a .dockercfg from there
 	if url, err := credentialconfig.ReadURL(DockerConfigURLKey, g.Client, metadataHeader); err != nil {
 		klog.Errorf("while reading 'google-dockercfg-url' metadata: %v", err)
@@ -233,7 +316,7 @@ type TokenBlob struct {
 }
 
 // Provide implements DockerConfigProvider
-func (g *ContainerRegistryProvider) Provide(image string) credentialconfig.DockerConfig {
+func (g *ContainerRegistryProvider) Provide(authRequest credentialproviderapi.CredentialProviderRequest) credentialconfig.DockerConfig {
 	cfg := credentialconfig.DockerConfig{}
 
 	tokenJSONBlob, err := credentialconfig.ReadURL(metadataToken, g.Client, metadataHeader)
@@ -263,7 +346,7 @@ func (g *ContainerRegistryProvider) Provide(image string) credentialconfig.Docke
 	// If UseRegistryFromImage is true, we will directly give the credential to the registry of the image.
 	// Currently, this is only used by auth-provider-gcp.
 	if g.UseRegistryFromImage {
-		if registry, _, found := strings.Cut(image, "/"); found {
+		if registry, _, found := strings.Cut(authRequest.Image, "/"); found {
 			cfg[registry] = entry
 		}
 	}
