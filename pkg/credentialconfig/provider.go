@@ -33,9 +33,7 @@ type DockerConfigProvider interface {
 	Enabled() bool
 	// Provide returns docker configuration.
 	// Implementations can be blocking - e.g. metadata server unavailable.
-	// The image is passed in as context in the event that the
-	// implementation depends on information in the image name to return
-	// credentials; implementations are safe to ignore the image.
+	// The authRequest is passed as context to the provider, as the implementation depends on information in the request to return credentials.
 	Provide(authRequest credentialproviderapi.CredentialProviderRequest) DockerConfig
 }
 
