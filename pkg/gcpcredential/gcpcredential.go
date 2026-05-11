@@ -80,83 +80,11 @@ type DockerConfigURLKeyProvider struct {
 	MetadataProvider
 }
 
-// WIFConfig is a config that uses K8sSAWIFProvider to exchange Kubernetes Service Account tokens for GCR credentials. It requires the following environment variables to be set:
-// - GCP_WIF_PROJECT_NUMBER: the project number of the GCP project that contains the workload identity pool and provider to use for token exchange.
-// - GCP_WIF_POOL_ID: the ID of the workload identity pool to use for token exchange.
-// - GCP_WIF_PROVIDER_ID: the ID of the workload identity provider to use for token exchange.
-type WIFConfig struct {
+type WIFProvider struct {
+	StsService    *sts.Service
 	ProjectNumber string
 	PoolId        string
 	ProviderId    string
-}
-
-// K8sSAWIFProvider is a DockerConfigProvider that uses Kubernetes Service Account tokens and Google STS API to exchange for access tokens, which are then used as credentials for GCR.
-type K8sSAWIFProvider struct {
-	WIFConfig
-	StsService           *sts.Service
-	UseRegistryFromImage bool
-}
-
-// Enabled checks if K8sSAWIF provider is available
-func (g *K8sSAWIFProvider) Enabled() bool {
-	if g.ProjectNumber == "" || g.PoolId == "" || g.ProviderId == "" {
-		klog.V(2).Infof("K8sSAWIFProvider is not enabled because one of the required environment variables is not set. GCP_WIF_PROJECT_NUMBER: %t, GCP_WIF_POOL_ID: %t, GCP_WIF_PROVIDER_ID: %t", g.ProjectNumber != "", g.PoolId != "", g.ProviderId != "")
-		return false
-	}
-
-	return true
-}
-
-// Provide implements DockerConfigProvider. It exchanges the provided service account token for an access token using the STS API, and returns a DockerConfig with that access token as the password.
-func (g *K8sSAWIFProvider) Provide(authRequest credentialproviderapi.CredentialProviderRequest) credentialconfig.DockerConfig {
-	cfg := credentialconfig.DockerConfig{}
-
-	if g.ProjectNumber == "" || g.PoolId == "" || g.ProviderId == "" {
-		klog.Errorf("K8sSAWIFProvider is not properly configured. One of the required environment variables is not set. GCP_WIF_PROJECT_NUMBER: %t, GCP_WIF_POOL_ID: %t, GCP_WIF_PROVIDER_ID: %t", g.ProjectNumber != "", g.PoolId != "", g.ProviderId != "")
-		return cfg
-	}
-
-	audience := fmt.Sprintf(
-		"//iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s/providers/%s",
-		g.ProjectNumber,
-		g.PoolId,
-		g.ProviderId,
-	)
-
-	stsRequest := &sts.GoogleIdentityStsV1ExchangeTokenRequest{
-		Audience:           audience,
-		GrantType:          "urn:ietf:params:oauth:grant-type:token-exchange",
-		Scope:              credentials.DefaultAuthScopes()[0],
-		RequestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
-		SubjectTokenType:   "urn:ietf:params:oauth:token-type:jwt",
-		SubjectToken:       authRequest.ServiceAccountToken,
-	}
-
-	stsResponse, err := g.StsService.V1.Token(stsRequest).Do()
-	if err != nil {
-		klog.Errorf("IdentityBindingToken exchange error with audience %q: %v", audience, err)
-		return cfg
-	}
-
-	entry := credentialconfig.DockerConfigEntry{
-		Username: "_token",
-		Password: stsResponse.AccessToken,
-	}
-
-	// If UseRegistryFromImage is true, we will directly give the credential to the registry of the image.
-	// Currently, this is only used by auth-provider-gcp.
-	if g.UseRegistryFromImage {
-		if registry, _, found := strings.Cut(authRequest.Image, "/"); found {
-			cfg[registry] = entry
-		}
-	}
-
-	// Add our entry for each of the supported container registry URLs
-	for _, k := range containerRegistryUrls {
-		cfg[k] = entry
-	}
-
-	return cfg
 }
 
 // ContainerRegistryProvider is a DockerConfigProvider that provides a dockercfg with:
@@ -165,6 +93,7 @@ func (g *K8sSAWIFProvider) Provide(authRequest credentialproviderapi.CredentialP
 //	Password: "{access token from metadata}"
 type ContainerRegistryProvider struct {
 	MetadataProvider
+	WIFProvider
 	UseRegistryFromImage bool
 }
 
@@ -193,6 +122,10 @@ func onGCEVM() bool {
 		name = strings.TrimSpace(string(data))
 	}
 	return name == "Google" || name == "Google Compute Engine"
+}
+
+func (g *ContainerRegistryProvider) wifEnabled() bool {
+	return g.ProjectNumber != "" && g.ProviderId != "" && g.PoolId != ""
 }
 
 // Enabled implements DockerConfigProvider for all of the Google implementations.
@@ -263,6 +196,10 @@ func runWithBackoff(f func() ([]byte, error)) []byte {
 // and "http://metadata.google.internal./computeMetadata/v1/instance/service-accounts/default/scopes" will also return `200`.
 // More information on metadata service can be found here - https://cloud.google.com/compute/docs/storing-retrieving-metadata
 func (g *ContainerRegistryProvider) Enabled() bool {
+	if g.wifEnabled() {
+		return true
+	}
+
 	// Given that we are on GCE, we should keep retrying until the metadata server responds.
 	value := runWithBackoff(func() ([]byte, error) {
 		value, err := credentialconfig.ReadURL(serviceAccounts, g.Client, metadataHeader)
@@ -319,28 +256,38 @@ type TokenBlob struct {
 func (g *ContainerRegistryProvider) Provide(authRequest credentialproviderapi.CredentialProviderRequest) credentialconfig.DockerConfig {
 	cfg := credentialconfig.DockerConfig{}
 
-	tokenJSONBlob, err := credentialconfig.ReadURL(metadataToken, g.Client, metadataHeader)
-	if err != nil {
-		klog.Errorf("while reading access token endpoint: %v", err)
-		return cfg
-	}
-
-	email, err := credentialconfig.ReadURL(metadataEmail, g.Client, metadataHeader)
-	if err != nil {
-		klog.Errorf("while reading email endpoint: %v", err)
-		return cfg
-	}
-
-	var parsedBlob TokenBlob
-	if err := json.Unmarshal([]byte(tokenJSONBlob), &parsedBlob); err != nil {
-		klog.Errorf("while parsing json blob %s: %v", tokenJSONBlob, err)
-		return cfg
-	}
-
 	entry := credentialconfig.DockerConfigEntry{
 		Username: "_token",
-		Password: parsedBlob.AccessToken,
-		Email:    string(email),
+	}
+
+	if authRequest.ServiceAccountToken != "" {
+		token, err := g.WIFProvider.exchangeToken(authRequest.ServiceAccountToken)
+		if err != nil {
+			klog.Errorf("failed to exchange token with STS: %v", err)
+			return cfg
+		}
+		entry.Password = token.AccessToken
+	} else {
+		tokenJSONBlob, err := credentialconfig.ReadURL(metadataToken, g.Client, metadataHeader)
+		if err != nil {
+			klog.Errorf("while reading access token endpoint: %v", err)
+			return cfg
+		}
+
+		email, err := credentialconfig.ReadURL(metadataEmail, g.Client, metadataHeader)
+		if err != nil {
+			klog.Errorf("while reading email endpoint: %v", err)
+			return cfg
+		}
+
+		var parsedBlob TokenBlob
+		if err := json.Unmarshal([]byte(tokenJSONBlob), &parsedBlob); err != nil {
+			klog.Errorf("while parsing json blob %s: %v", tokenJSONBlob, err)
+			return cfg
+		}
+
+		entry.Password = parsedBlob.AccessToken
+		entry.Email = string(email)
 	}
 
 	// If UseRegistryFromImage is true, we will directly give the credential to the registry of the image.
@@ -356,4 +303,29 @@ func (g *ContainerRegistryProvider) Provide(authRequest credentialproviderapi.Cr
 		cfg[k] = entry
 	}
 	return cfg
+}
+
+func (w *WIFProvider) exchangeToken(serviceAccountToken string) (*sts.GoogleIdentityStsV1ExchangeTokenResponse, error) {
+	audience := fmt.Sprintf(
+		"//iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s/providers/%s",
+		w.ProjectNumber,
+		w.PoolId,
+		w.ProviderId,
+	)
+
+	stsRequest := &sts.GoogleIdentityStsV1ExchangeTokenRequest{
+		Audience:           audience,
+		GrantType:          "urn:ietf:params:oauth:grant-type:token-exchange",
+		Scope:              credentials.DefaultAuthScopes()[0],
+		RequestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+		SubjectTokenType:   "urn:ietf:params:oauth:token-type:jwt",
+		SubjectToken:       serviceAccountToken,
+	}
+
+	stsResponse, err := w.StsService.V1.Token(stsRequest).Do()
+	if err != nil {
+		return nil, err
+	}
+
+	return stsResponse, nil
 }

@@ -36,12 +36,14 @@ const (
 	gcrAuthFlow             = "gcr"
 	dockerConfigAuthFlow    = "dockercfg"
 	dockerConfigURLAuthFlow = "dockercfg-url"
-	k8sSAWIFAuthFlow        = "k8s-sa-wif"
 )
 
 // CredentialOptions contains a representation of the options passed to the credential provider.
 type CredentialOptions struct {
-	AuthFlow string
+	AuthFlow         string
+	WIFProjectNumber string
+	WIFPoolID        string
+	WIFProviderID    string
 }
 
 // AuthFlowFlagError represents an error that occurred during flag validation.
@@ -51,7 +53,7 @@ type AuthFlowFlagError struct {
 
 // Error implements error.Error.
 func (a *AuthFlowFlagError) Error() string {
-	return fmt.Sprintf("invalid value %q for authFlow (must be one of %q, %q, %q, or %q)", a.flagValue, gcrAuthFlow, dockerConfigAuthFlow, dockerConfigURLAuthFlow, k8sSAWIFAuthFlow)
+	return fmt.Sprintf("invalid value %q for authFlow (must be one of %q, %q, or %q)", a.flagValue, gcrAuthFlow, dockerConfigAuthFlow, dockerConfigURLAuthFlow)
 }
 
 // Is implements the Is function that errors.Is checks for.
@@ -83,7 +85,7 @@ func NewGetCredentialsCommand() (*cobra.Command, error) {
 		Use:   "get-credentials",
 		Short: "Get authentication credentials",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return getCredentials(options.AuthFlow)
+			return getCredentials(options)
 		},
 	}
 	defineFlags(cmd, &options)
@@ -93,25 +95,23 @@ func NewGetCredentialsCommand() (*cobra.Command, error) {
 	return cmd, nil
 }
 
-func providerFromFlow(flow string) (credentialconfig.DockerConfigProvider, error) {
+func makeProvider(options CredentialOptions) (credentialconfig.DockerConfigProvider, error) {
 	transport := utilnet.SetTransportDefaults(&http.Transport{})
-	switch flow {
+	switch options.AuthFlow {
 	case gcrAuthFlow:
-		return provider.MakeRegistryProvider(transport), nil
+		return provider.MakeRegistryProvider(transport, options.WIFProjectNumber, options.WIFPoolID, options.WIFProviderID)
 	case dockerConfigAuthFlow:
 		return provider.MakeDockerConfigProvider(transport), nil
 	case dockerConfigURLAuthFlow:
 		return provider.MakeDockerConfigURLProvider(transport), nil
-	case k8sSAWIFAuthFlow:
-		return provider.MakeK8sSAWIFProvider(transport)
 	default:
-		return nil, &AuthFlowTypeError{requestedFlow: flow}
+		return nil, &AuthFlowTypeError{requestedFlow: options.AuthFlow}
 	}
 }
 
-func getCredentials(authFlow string) error {
-	klog.V(2).Infof("get-credentials (authFlow %s)", authFlow)
-	authProvider, err := providerFromFlow(authFlow)
+func getCredentials(options CredentialOptions) error {
+	klog.V(2).Infof("get-credentials (authFlow %s)", options.AuthFlow)
+	authProvider, err := makeProvider(options)
 	if err != nil {
 		return err
 	}
@@ -139,11 +139,14 @@ func getCredentials(authFlow string) error {
 }
 
 func defineFlags(credCmd *cobra.Command, options *CredentialOptions) {
-	credCmd.Flags().StringVarP(&options.AuthFlow, "authFlow", "a", gcrAuthFlow, fmt.Sprintf("authentication flow (valid values are %q, %q, %q, and %q)", gcrAuthFlow, dockerConfigAuthFlow, dockerConfigURLAuthFlow, k8sSAWIFAuthFlow))
+	credCmd.Flags().StringVarP(&options.AuthFlow, "authFlow", "a", gcrAuthFlow, fmt.Sprintf("authentication flow (valid values are %q, %q, and %q)", gcrAuthFlow, dockerConfigAuthFlow, dockerConfigURLAuthFlow))
+	credCmd.Flags().StringVarP(&options.WIFProjectNumber, "gcpWIFProjectNumber", "", "", fmt.Sprintf("Number of GCP project used for Workload Identity Federation (required when using Service Account Token Integration for image pulls)."))
+	credCmd.Flags().StringVarP(&options.WIFPoolID, "gcpWIFPoolID", "", "", fmt.Sprintf("ID of the Workload Identity Pool used for Workload Identity Federation (required when using Service Account Token Integration for image pulls)."))
+	credCmd.Flags().StringVarP(&options.WIFProviderID, "gcpWIFProviderID", "", "", fmt.Sprintf("ID of the Workload Identity Provider used for Workload Identity Federation (required when using Service Account Token Integration for image pulls)."))
 }
 
 func validateFlags(options *CredentialOptions) error {
-	if options.AuthFlow != gcrAuthFlow && options.AuthFlow != dockerConfigAuthFlow && options.AuthFlow != dockerConfigURLAuthFlow && options.AuthFlow != k8sSAWIFAuthFlow {
+	if options.AuthFlow != gcrAuthFlow && options.AuthFlow != dockerConfigAuthFlow && options.AuthFlow != dockerConfigURLAuthFlow {
 		return &AuthFlowFlagError{flagValue: options.AuthFlow}
 	}
 	return nil

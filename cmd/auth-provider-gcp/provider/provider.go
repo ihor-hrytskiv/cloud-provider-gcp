@@ -43,13 +43,25 @@ const (
 )
 
 // MakeRegistryProvider returns a ContainerRegistryProvider with the given transport.
-func MakeRegistryProvider(transport *http.Transport) *gcpcredential.ContainerRegistryProvider {
+func MakeRegistryProvider(transport *http.Transport, projectNumber, poolID, providerID string) (*gcpcredential.ContainerRegistryProvider, error) {
 	httpClient := makeHTTPClient(transport)
 	provider := &gcpcredential.ContainerRegistryProvider{
 		MetadataProvider:     gcpcredential.MetadataProvider{Client: httpClient},
 		UseRegistryFromImage: true,
 	}
-	return provider
+	if projectNumber != "" && poolID != "" && providerID != "" {
+		stsService, err := sts.NewService(context.Background(), option.WithHTTPClient(httpClient))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create sts service: %w", err)
+		}
+		provider.WIFProvider = gcpcredential.WIFProvider{
+			StsService:    stsService,
+			ProjectNumber: projectNumber,
+			PoolId:        poolID,
+			ProviderId:    providerID,
+		}
+	}
+	return provider, nil
 }
 
 // MakeDockerConfigProvider returns a DockerConfigKeyProvider with the given transport.
@@ -68,26 +80,6 @@ func MakeDockerConfigURLProvider(transport *http.Transport) *gcpcredential.Docke
 		MetadataProvider: gcpcredential.MetadataProvider{Client: httpClient},
 	}
 	return provider
-}
-
-func MakeK8sSAWIFProvider(transport *http.Transport) (*gcpcredential.K8sSAWIFProvider, error) {
-	ctx := context.Background()
-	httpClient := makeHTTPClient(transport)
-	stsService, err := sts.NewService(ctx, option.WithHTTPClient(httpClient))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create sts service: %w", err)
-	}
-	provider := &gcpcredential.K8sSAWIFProvider{
-		WIFConfig: gcpcredential.WIFConfig{
-			ProjectNumber: os.Getenv("GCP_WIF_PROJECT_NUMBER"),
-			PoolId:        os.Getenv("GCP_WIF_POOL_ID"),
-			ProviderId:    os.Getenv("GCP_WIF_PROVIDER_ID"),
-		},
-		StsService:           stsService,
-		UseRegistryFromImage: true,
-	}
-
-	return provider, nil
 }
 
 func makeHTTPClient(transport *http.Transport) *http.Client {
